@@ -1,54 +1,50 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 
+	"github.com/mhingston/azoai"
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 )
 
 type Config struct {
-	APIKey       string `json:"api-key"`
-	APIEndpoint  string `json:"api-endpoint"`
-	DeploymentID string `json:"deployment-id"`
-	SystemPrompt string `json:"system-prompt"`
+	APIKey       string `mapstructure:"api-key"`
+	APIEndpoint  string `mapstructure:"api-endpoint"`
+	APIVersion   string `mapstructure:"api-version"`
+	Deployment   string `mapstructure:"deployment"`
+	SystemPrompt string `mapstructure:"system-prompt"`
 }
 
-var cfgFile string
 var config Config
 
-func loadConfig() {
-	// Load config from file if specified
-	if cfgFile != "" {
-		configFile, err := os.ReadFile(cfgFile)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error reading config file: %s\n", err)
-			os.Exit(1)
-		}
+func initConfig() {
+	// Find home directory for config file
+	homeDir, err := os.UserHomeDir()
+	cobra.CheckErr(err)
 
-		err = json.Unmarshal(configFile, &config)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error parsing config file: %s\n", err)
-			os.Exit(1)
-		}
+	viper.AddConfigPath(homeDir)
+	viper.SetConfigName(".hm")
+	viper.SetConfigType("json")
+
+	viper.AutomaticEnv() // read in environment variables that match
+
+	// If a config file is found, read it in.
+	if err := viper.ReadInConfig(); err == nil {
+		fmt.Fprintln(os.Stderr, "Using config file:", viper.ConfigFileUsed())
 	}
 
-	// Check for required config values
-	if config.APIKey == "" || config.APIEndpoint == "" || config.DeploymentID == "" {
-		fmt.Fprintln(os.Stderr, "Missing required configuration values (API key, endpoint, or deployment ID).")
+	// Unmarshal config into struct (this will be overridden by flags later)
+	if err := viper.Unmarshal(&config); err != nil {
+		fmt.Fprintf(os.Stderr, "Error parsing config file: %s\n", err)
 		os.Exit(1)
 	}
 }
 
-func callOpenAI(promptType, userInput string) (string, error) {
-	url := fmt.Sprintf("%s/openai/deployments/%s/chat/completions?api-version=2024-06-01", config.APIEndpoint, config.DeploymentID)
-
+func getCompletion(promptType, userInput string) (string, error) {
 	// Get shell information (best effort)
 	shell := os.Getenv("SHELL")
 	if shell == "" {
@@ -59,88 +55,61 @@ func callOpenAI(promptType, userInput string) (string, error) {
 
 	systemPrompt := config.SystemPrompt
 	if systemPrompt == "" {
-		systemPrompt = "You are a helpful and concise command-line interface (CLI) assistant. You should provide clear and accurate explanations or suggestions for CLI commands and tasks. Prioritize commands and syntax appropriate for this platform and shell. If the user's query is unclear apologise that you aren't able to help."
+		systemPrompt = "You are a helpful and concise command-line interface (CLI) assistant. You should provide clear and accurate explanations or suggestions for CLI commands and tasks. Prioritise commands and syntax appropriate for this platform and shell. If the user's query is unclear apologise that you aren't able to help."
 	}
 
 	systemPrompt = fmt.Sprintf("%s\n\nThe current platform is %s %s, likely using %s.", systemPrompt, runtime.GOOS, runtime.GOARCH, shell)
 
-	requestBody := map[string]interface{}{
-		"messages": []map[string]string{
-			{"role": "system", "content": systemPrompt},
-			{"role": "user", "content": fmt.Sprintf("%s the following: %s", promptType, userInput)},
-		},
+	apiVersion := config.APIVersion
+	if apiVersion == "" {
+		apiVersion = "2024-06-01"
 	}
 
-	requestBodyJSON, err := json.Marshal(requestBody)
-	if err != nil {
-		return "", fmt.Errorf("error marshaling request body: %w", err)
-	}
+	resp, err := azoai.InvokeOpenAIRequest(azoai.OpenAIRequest{
+		SystemPrompt: systemPrompt,
+		Message:      fmt.Sprintf("%s the following: %s", promptType, userInput),
+		ApiBaseUrl:   config.APIEndpoint,
+		APIKey:       config.APIKey,
+		APIVersion:   apiVersion,
+		Deployment:   config.Deployment,
+	})
 
-	req, err := http.NewRequest("POST", url, strings.NewReader(string(requestBodyJSON)))
-	if err != nil {
-		return "", fmt.Errorf("error creating request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("api-key", config.APIKey)
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("error sending request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("error reading response body: %w", err)
-	}
-
-	var response struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-	}
-
-	err = json.Unmarshal(responseBody, &response)
-	if err != nil {
-		return "", fmt.Errorf("error unmarshalling response: %w", err)
-	}
-
-	if len(response.Choices) > 0 {
-		return response.Choices[0].Message.Content, nil
-	}
-
-	return "", fmt.Errorf("no content found in response")
+	return resp, err
 }
 
 func runExplain(cmd *cobra.Command, args []string) {
 	userInput := strings.Join(args, " ")
-	explanation, err := callOpenAI("Explain the following command", userInput)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %s\n", err)
-		os.Exit(1)
-	}
+	explanation, err := getCompletion("Explain the following command", userInput)
+	cobra.CheckErr(err)
 	fmt.Println(explanation)
 }
 
 func runSuggest(cmd *cobra.Command, args []string) {
 	userInput := strings.Join(args, " ")
-	suggestion, err := callOpenAI("Suggest a command from the following description", userInput)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %s\n", err)
-		os.Exit(1)
-
-	}
+	suggestion, err := getCompletion("Suggest a command from the following description", userInput)
+	cobra.CheckErr(err)
 	fmt.Println(suggestion)
 }
 
 func main() {
+	cobra.OnInitialize(initConfig)
+
 	rootCmd := &cobra.Command{
 		Use:   "hm",
 		Short: "Help Me - A CLI tool for explanations and suggestions",
+		PersistentPreRun: func(cmd *cobra.Command, args []string) {
+			// Unmarshal config again after flags are processed
+			if err := viper.Unmarshal(&config); err != nil {
+				fmt.Fprintf(os.Stderr, "Error parsing config: %s\n", err)
+				os.Exit(1)
+			}
+
+			// Check for required config values
+			if config.APIKey == "" || config.APIEndpoint == "" || config.Deployment == "" {
+				fmt.Fprintln(os.Stderr, "Missing required configuration values (API key, endpoint, or deployment ID). Please set them in the config file or using flags.")
+				os.Exit(1)
+			}
+		},
 	}
 
 	explainCmd := &cobra.Command{
@@ -155,27 +124,20 @@ func main() {
 		Run:   runSuggest,
 	}
 
-	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.hm.json)")
 	rootCmd.PersistentFlags().StringVar(&config.APIKey, "api-key", "", "Azure OpenAI API key")
 	rootCmd.PersistentFlags().StringVar(&config.APIEndpoint, "api-endpoint", "", "Azure OpenAI API endpoint")
-	rootCmd.PersistentFlags().StringVar(&config.DeploymentID, "deployment-id", "", "Azure OpenAI Deployment ID")
+	rootCmd.PersistentFlags().StringVar(&config.APIVersion, "api-version", "", "Azure OpenAI API version")
+	rootCmd.PersistentFlags().StringVar(&config.Deployment, "deployment", "", "Azure OpenAI Deployment ID")
 	rootCmd.PersistentFlags().StringVar(&config.SystemPrompt, "system-prompt", "", "System prompt")
+
+	// Bind flags to Viper for config file support
+	viper.BindPFlag("api-key", rootCmd.PersistentFlags().Lookup("api-key"))
+	viper.BindPFlag("api-endpoint", rootCmd.PersistentFlags().Lookup("api-endpoint"))
+	viper.BindPFlag("api-version", rootCmd.PersistentFlags().Lookup("api-version"))
+	viper.BindPFlag("deployment", rootCmd.PersistentFlags().Lookup("deployment"))
+	viper.BindPFlag("system-prompt", rootCmd.PersistentFlags().Lookup("system-prompt"))
 
 	rootCmd.AddCommand(explainCmd, suggestCmd)
 
-	// Find home directory for config file
-	homeDir, err := os.UserHomeDir()
-	if err == nil {
-		defaultCfgFile := filepath.Join(homeDir, ".hm.json")
-		if cfgFile == "" { // Use default config file if none specified
-			cfgFile = defaultCfgFile
-		}
-	}
-
-	loadConfig() // Load config *after* flags are parsed
-	if err := rootCmd.Execute(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %s\n", err)
-		os.Exit(1)
-	}
-
+	cobra.CheckErr(rootCmd.Execute())
 }
